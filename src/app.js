@@ -80,7 +80,7 @@ function createApp({ store, adminPassword, secureCookies = false }) {
     return token;
   }
 
-  function renderParticipant(req, res, error) {
+  function renderParticipant(req, res, error, draft = '') {
     const title = surveyTitle();
     const token = participantToken(req, res);
     res.set('Cache-Control', 'no-store');
@@ -97,7 +97,7 @@ function createApp({ store, adminPassword, secureCookies = false }) {
     if (!question) {
       return res.send(views.messagePage(title, 'No questions yet', 'The survey has no questions yet. Please come back later.'));
     }
-    res.status(error ? 400 : 200).send(views.questionPage(title, question, error));
+    res.status(error ? 400 : 200).send(views.questionPage(title, question, { error, draft, maxLength: MAX_ANSWER_LENGTH }));
   }
 
   app.get('/', (req, res) => renderParticipant(req, res));
@@ -111,14 +111,13 @@ function createApp({ store, adminPassword, secureCookies = false }) {
       return res.send(views.messagePage(title, 'Survey closed', 'This survey is not accepting new answers at the moment.'));
     }
 
-    const question = store.getQuestion(assignment.question_id);
-    const answer = String(req.body.answer ?? '').trim();
+    const answer = String(req.body.answer ?? '')
+      .replace(/\r\n?/g, '\n')
+      .trim();
     let error;
-    if (!answer) error = 'Please provide an answer.';
+    if (!answer) error = 'Please write your answer before submitting.';
     else if (answer.length > MAX_ANSWER_LENGTH) error = `Your answer is too long (max ${MAX_ANSWER_LENGTH} characters).`;
-    else if (question.type === 'rating' && !['1', '2', '3', '4', '5'].includes(answer)) error = 'Please pick a value from 1 to 5.';
-    else if (question.type === 'choice' && !question.options.includes(answer)) error = 'Please pick one of the options.';
-    if (error) return renderParticipant(req, res, error);
+    if (error) return renderParticipant(req, res, error, answer);
 
     store.submitAnswer(token, answer);
     res.redirect(303, '/');
@@ -211,9 +210,19 @@ function createApp({ store, adminPassword, secureCookies = false }) {
     return Number.isInteger(id) && id > 0 ? id : undefined;
   };
 
+  const searchParam = (req) => String(req.query.q ?? '').trim().slice(0, 200) || undefined;
+
   admin.get('/responses', (req, res) => {
     const questionId = questionIdParam(req);
-    res.send(views.responsesPage({ responses: store.listResponses({ questionId }), questions: store.listQuestions(), questionId }));
+    const search = searchParam(req);
+    res.send(
+      views.responsesPage({
+        responses: store.listResponses({ questionId, search }),
+        questions: store.listQuestions(),
+        questionId,
+        search,
+      })
+    );
   });
 
   admin.get('/questions', (req, res) => {
@@ -222,7 +231,7 @@ function createApp({ store, adminPassword, secureCookies = false }) {
 
   admin.post('/questions', (req, res) => {
     try {
-      store.addQuestion(req.body);
+      store.addQuestion(req.body.text);
       res.redirect(303, '/admin/questions?msg=Question+added');
     } catch (err) {
       if (!(err instanceof ValidationError)) throw err;
@@ -235,7 +244,12 @@ function createApp({ store, adminPassword, secureCookies = false }) {
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter(Boolean);
-    lines.forEach((text) => store.addQuestion({ text, type: 'text' }));
+    try {
+      store.transaction(() => lines.forEach((text) => store.addQuestion(text)));
+    } catch (err) {
+      if (!(err instanceof ValidationError)) throw err;
+      return res.status(400).send(views.questionsPage({ questions: store.listQuestions(), error: err.message }));
+    }
     res.redirect(303, `/admin/questions?msg=${encodeURIComponent(`${lines.length} question(s) added`)}`);
   });
 
@@ -251,11 +265,11 @@ function createApp({ store, adminPassword, secureCookies = false }) {
 
   admin.post('/questions/:id', loadQuestion, (req, res) => {
     try {
-      store.updateQuestion(req.question.id, req.body);
+      store.updateQuestion(req.question.id, req.body.text);
       res.redirect(303, '/admin/questions?msg=Question+saved');
     } catch (err) {
       if (!(err instanceof ValidationError)) throw err;
-      res.status(400).send(views.editQuestionPage({ ...req.question, ...req.body, options: String(req.body.options || '').split(/\r?\n/) }, err.message));
+      res.status(400).send(views.editQuestionPage({ ...req.question, text: req.body.text }, err.message));
     }
   });
 
@@ -272,8 +286,7 @@ function createApp({ store, adminPassword, secureCookies = false }) {
   // ---- Excel export ---------------------------------------------------------
 
   admin.get('/export.xlsx', async (req, res) => {
-    const questionId = questionIdParam(req);
-    const workbook = await buildWorkbook(store, { questionId, title: surveyTitle() });
+    const workbook = await buildWorkbook(store, { questionId: questionIdParam(req), search: searchParam(req), title: surveyTitle() });
     const stamp = new Date().toISOString().slice(0, 10);
     res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.set('Content-Disposition', `attachment; filename="survey-responses-${stamp}.xlsx"`);
@@ -285,67 +298,84 @@ function createApp({ store, adminPassword, secureCookies = false }) {
   return app;
 }
 
-async function buildWorkbook(store, { questionId, title }) {
+const wordCount = (text) => text.split(/\s+/).filter(Boolean).length;
+
+// Excel treats cells starting with = + - @ as formulas; neutralise them.
+const safeText = (v) => (/^[=+\-@\t\r]/.test(v) ? `'${v}` : v);
+
+async function buildWorkbook(store, { questionId, search, title }) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = title;
   workbook.created = new Date();
 
-  const header = (sheet) => {
+  const header = (sheet, { filter = true } = {}) => {
     const row = sheet.getRow(1);
     row.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF3B5BDB' } };
+    row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF171717' } };
+    row.alignment = { wrapText: true, vertical: 'top' };
     sheet.views = [{ state: 'frozen', ySplit: 1 }];
-    sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: sheet.columnCount } };
+    if (filter) sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: sheet.columnCount } };
   };
+  const wrap = (sheet, ...keys) => keys.forEach((k) => (sheet.getColumn(k).alignment = { wrapText: true, vertical: 'top' }));
 
-  // Excel treats cells starting with = + - @ as formulas; neutralise them.
-  const safeText = (v) => (/^[=+\-@\t\r]/.test(v) ? `'${v}` : v);
+  const responses = store.listResponses({ questionId, search }).reverse();
+  const questions = store.listQuestions().filter((q) => !questionId || q.id === questionId);
 
-  const responses = store.listResponses({ questionId }).reverse();
+  // 1. One row per answer — best for filtering and sorting.
   const sheet = workbook.addWorksheet('Responses');
   sheet.columns = [
     { header: 'Response ID', key: 'id', width: 12 },
     { header: 'Question ID', key: 'question_id', width: 12 },
-    { header: 'Question', key: 'question', width: 60 },
-    { header: 'Question type', key: 'type', width: 16 },
-    { header: 'Answer', key: 'answer', width: 70 },
+    { header: 'Question', key: 'question', width: 50 },
+    { header: 'Answer', key: 'answer', width: 80 },
+    { header: 'Words', key: 'words', width: 9 },
     { header: 'Submitted at (UTC)', key: 'submitted_at', width: 20 },
   ];
   for (const r of responses) {
     sheet.addRow({
       ...r,
       question: safeText(r.question),
-      answer: r.type === 'rating' ? Number(r.answer) : safeText(r.answer),
+      answer: safeText(r.answer),
+      words: wordCount(r.answer),
       submitted_at: new Date(`${r.submitted_at.replace(' ', 'T')}Z`),
     });
   }
-  sheet.getColumn('submitted_at').numFmt = 'yyyy-mm-dd hh:mm:ss';
-  sheet.getColumn('question').alignment = { wrapText: true, vertical: 'top' };
-  sheet.getColumn('answer').alignment = { wrapText: true, vertical: 'top' };
+  sheet.getColumn('submitted_at').numFmt = 'yyyy-mm-dd hh:mm';
+  wrap(sheet, 'question', 'answer');
   header(sheet);
 
+  // 2. One column per question with its answers underneath — best for reading.
+  const byQuestion = new Map(questions.map((q) => [q.id, []]));
+  for (const r of responses) byQuestion.get(r.question_id)?.push(r.answer);
+  const columns = questions.filter((q) => byQuestion.get(q.id).length > 0);
+  const grid = workbook.addWorksheet('By question');
+  grid.columns = columns.map((q) => ({ header: `#${q.id} ${q.text}`, key: `q${q.id}`, width: 45 }));
+  const depth = Math.max(0, ...columns.map((q) => byQuestion.get(q.id).length));
+  for (let i = 0; i < depth; i++) {
+    grid.addRow(Object.fromEntries(columns.map((q) => [`q${q.id}`, safeText(byQuestion.get(q.id)[i] ?? '')])));
+  }
+  if (columns.length) {
+    wrap(grid, ...columns.map((q) => `q${q.id}`));
+    header(grid, { filter: false });
+    grid.getRow(1).height = 60;
+  }
+
+  // 3. Overview per question.
   const summary = workbook.addWorksheet('Summary');
   summary.columns = [
     { header: 'Question ID', key: 'id', width: 12 },
     { header: 'Question', key: 'text', width: 60 },
-    { header: 'Type', key: 'type', width: 16 },
     { header: 'Active', key: 'active', width: 8 },
     { header: 'Participants assigned', key: 'assigned_count', width: 22 },
-    { header: 'Answers', key: 'response_count', width: 10 },
-    { header: 'Average rating', key: 'avg', width: 15 },
+    { header: 'Answers', key: 'answers', width: 10 },
+    { header: 'Average words', key: 'avg', width: 15 },
   ];
-  const byQuestion = new Map();
-  for (const r of store.listResponses()) {
-    if (!byQuestion.has(r.question_id)) byQuestion.set(r.question_id, []);
-    byQuestion.get(r.question_id).push(r.answer);
+  for (const q of questions) {
+    const answers = byQuestion.get(q.id);
+    const avg = answers.length ? Math.round(answers.reduce((n, a) => n + wordCount(a), 0) / answers.length) : '';
+    summary.addRow({ ...q, text: safeText(q.text), active: q.active ? 'Yes' : 'No', answers: answers.length, avg });
   }
-  for (const q of store.listQuestions()) {
-    if (questionId && q.id !== questionId) continue;
-    const answers = byQuestion.get(q.id) || [];
-    const avg = q.type === 'rating' && answers.length ? answers.reduce((s, a) => s + Number(a), 0) / answers.length : null;
-    summary.addRow({ ...q, text: safeText(q.text), active: q.active ? 'Yes' : 'No', avg: avg === null ? '' : Math.round(avg * 100) / 100 });
-  }
-  summary.getColumn('text').alignment = { wrapText: true, vertical: 'top' };
+  wrap(summary, 'text');
   header(summary);
 
   return workbook;

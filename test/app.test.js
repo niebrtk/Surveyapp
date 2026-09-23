@@ -43,15 +43,9 @@ function browser() {
   };
 }
 
-function answerFor(question) {
-  if (question.type === 'rating') return '4';
-  if (question.type === 'choice') return question.options[0];
-  return 'My answer';
-}
-
 async function assignedQuestion(page) {
   const html = await page('/').then((r) => r.text());
-  const text = html.match(/<h1>(.*?)<\/h1>/)[1];
+  const text = html.match(/<h1 id="question">(.*?)<\/h1>/)[1];
   return store.listQuestions().find((q) => q.text.replace(/'/g, '&#39;') === text);
 }
 
@@ -62,8 +56,23 @@ async function loggedInAdmin() {
   return admin;
 }
 
-test('seeds 50 questions', () => {
-  assert.strictEqual(store.listQuestions().length, 50);
+test('seeds 50 open questions', () => {
+  const questions = store.listQuestions();
+  assert.strictEqual(questions.length, 50);
+  assert.deepStrictEqual(Object.keys(questions[0]).sort(), ['active', 'assigned_count', 'created_at', 'id', 'response_count', 'text']);
+});
+
+test('participants get a free-text answer box', async () => {
+  const html = await browser()('/').then((r) => r.text());
+  assert.match(html, /<textarea name="answer"[^>]*maxlength="5000"[^>]*required/);
+  assert.doesNotMatch(html, /type="radio"/);
+});
+
+test('multi-line answers are stored with their line breaks', async () => {
+  const page = browser();
+  await assignedQuestion(page);
+  await page('/', { form: { answer: '  First line\r\n\r\nSecond line  ' } });
+  assert.strictEqual(store.listResponses()[0].answer, 'First line\n\nSecond line');
 });
 
 test('a participant keeps the same question and can answer only once', async () => {
@@ -73,21 +82,21 @@ test('a participant keeps the same question and can answer only once', async () 
   assert.ok(q1);
   assert.strictEqual(q1.id, q2.id, 'reloading must not change the question');
 
-  const res = await page('/', { form: { answer: answerFor(q1) } });
+  const res = await page('/', { form: { answer: 'My answer' } });
   assert.strictEqual(res.status, 303);
 
   const after = await page('/').then((r) => r.text());
   assert.match(after, /completed this survey/);
 
   // A second submission is ignored.
-  await page('/', { form: { answer: answerFor(q1) } });
+  await page('/', { form: { answer: 'My answer' } });
   assert.strictEqual(store.stats().responses, 1);
 });
 
 test('answers are stored without any link to the participant', async () => {
   const page = browser();
   const q = await assignedQuestion(page);
-  await page('/', { form: { answer: answerFor(q) } });
+  await page('/', { form: { answer: 'My answer' } });
   const columns = store.db.prepare('PRAGMA table_info(responses)').all().map((c) => c.name);
   assert.deepStrictEqual(columns, ['id', 'question_id', 'answer', 'submitted_at']);
 });
@@ -98,11 +107,16 @@ test('questions are distributed evenly across participants', async () => {
   assert.ok(counts.every((n) => n === 2), `expected 2 each, got ${counts}`);
 });
 
-test('invalid answers are rejected', async () => {
+test('empty and too long answers are rejected, keeping the typed text', async () => {
   const page = browser();
-  const q = await assignedQuestion(page);
-  const res = await page('/', { form: { answer: q.type === 'text' ? '   ' : 'not-an-option' } });
-  assert.strictEqual(res.status, 400);
+  await assignedQuestion(page);
+  const empty = await page('/', { form: { answer: '   ' } });
+  assert.strictEqual(empty.status, 400);
+
+  const long = 'x'.repeat(5001);
+  const tooLong = await page('/', { form: { answer: long } });
+  assert.strictEqual(tooLong.status, 400);
+  assert.ok((await tooLong.text()).includes(long), 'typed text must be kept');
   assert.strictEqual(store.stats().responses, 0);
 });
 
@@ -116,7 +130,7 @@ test('closed survey does not accept new participants', async () => {
 test('deleting a question does not let finished participants answer again', async () => {
   const page = browser();
   const q = await assignedQuestion(page);
-  await page('/', { form: { answer: answerFor(q) } });
+  await page('/', { form: { answer: 'My answer' } });
   store.deleteQuestion(q.id);
   assert.match(await page('/').then((r) => r.text()), /completed this survey/);
 });
@@ -135,7 +149,7 @@ test('admin pages require login', async () => {
 test('admin sees responses and can export them to Excel', async () => {
   const page = browser();
   const q = await assignedQuestion(page);
-  await page('/', { form: { answer: q.type === 'text' ? '=HYPERLINK("x") <b>hi</b>' : answerFor(q) } });
+  await page('/', { form: { answer: '=HYPERLINK("x") <b>hi</b>' } });
 
   const admin = await loggedInAdmin();
   const list = await admin('/admin/responses').then((r) => r.text());
@@ -150,18 +164,35 @@ test('admin sees responses and can export them to Excel', async () => {
   const sheet = wb.getWorksheet('Responses');
   assert.strictEqual(sheet.rowCount, 2);
   assert.strictEqual(sheet.getRow(2).getCell(3).value, q.text);
-  const answer = sheet.getRow(2).getCell(5).value;
-  if (q.type === 'text') assert.ok(String(answer).startsWith("'="), 'formula injection must be neutralised');
+  assert.ok(String(sheet.getRow(2).getCell(4).value).startsWith("'="), 'formula injection must be neutralised');
+  assert.strictEqual(sheet.getRow(2).getCell(5).value, 2, 'word count');
+  const grid = wb.getWorksheet('By question');
+  assert.strictEqual(grid.getRow(1).getCell(1).value, `#${q.id} ${q.text}`);
   assert.strictEqual(wb.getWorksheet('Summary').rowCount, 51);
+});
+
+test('admin can search answers', async () => {
+  for (const answer of ['More coffee, please', 'Better tools', '100% remote']) {
+    const page = browser();
+    await assignedQuestion(page);
+    await page('/', { form: { answer } });
+  }
+  const admin = await loggedInAdmin();
+  const html = await admin('/admin/responses?q=coffee').then((r) => r.text());
+  assert.match(html, /Responses <small>\(1\)/);
+  assert.strictEqual(store.listResponses({ search: '%' }).length, 1, 'LIKE wildcards are matched literally');
 });
 
 test('admin can add, edit, deactivate and delete questions', async () => {
   const admin = await loggedInAdmin();
-  await admin('/admin/questions', { form: { text: 'Favourite colour?', type: 'choice', options: 'Red\nBlue' } });
+  await admin('/admin/questions', { form: { text: 'What is your favourite colour?' } });
   const added = store.listQuestions().at(-1);
-  assert.deepStrictEqual([added.text, added.options], ['Favourite colour?', ['Red', 'Blue']]);
+  assert.strictEqual(added.text, 'What is your favourite colour?');
 
-  await admin(`/admin/questions/${added.id}`, { form: { text: 'Favourite season?', type: 'text', options: '' } });
+  await admin('/admin/questions/bulk', { form: { lines: 'First?\n\nSecond?' } });
+  assert.strictEqual(store.listQuestions().length, 53);
+
+  await admin(`/admin/questions/${added.id}`, { form: { text: 'Favourite season?' } });
   assert.strictEqual(store.getQuestion(added.id).text, 'Favourite season?');
 
   await admin(`/admin/questions/${added.id}/toggle`, { form: {} });
@@ -170,7 +201,7 @@ test('admin can add, edit, deactivate and delete questions', async () => {
   await admin(`/admin/questions/${added.id}/delete`, { form: {} });
   assert.strictEqual(store.getQuestion(added.id), undefined);
 
-  const invalid = await admin('/admin/questions', { form: { text: 'Pick', type: 'choice', options: 'Only one' } });
+  const invalid = await admin('/admin/questions', { form: { text: '   ' } });
   assert.strictEqual(invalid.status, 400);
 });
 

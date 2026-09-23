@@ -3,7 +3,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
-const QUESTION_TYPES = ['text', 'rating', 'choice'];
+const MAX_QUESTION_LENGTH = 1000;
 
 function openDatabase(file) {
   if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -15,8 +15,6 @@ function openDatabase(file) {
     CREATE TABLE IF NOT EXISTS questions (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       text       TEXT NOT NULL,
-      type       TEXT NOT NULL DEFAULT 'text',
-      options    TEXT NOT NULL DEFAULT '[]',
       active     INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -53,7 +51,7 @@ function hashToken(token) {
 
 function parseQuestion(row) {
   if (!row) return row;
-  return { ...row, options: JSON.parse(row.options), active: !!row.active };
+  return { id: row.id, text: row.text, active: !!row.active, created_at: row.created_at, assigned_count: row.assigned_count, response_count: row.response_count };
 }
 
 class SurveyStore {
@@ -100,23 +98,17 @@ class SurveyStore {
     const { n } = this.db.prepare('SELECT COUNT(*) AS n FROM questions').get();
     if (n > 0) return 0;
     const seed = JSON.parse(fs.readFileSync(seedFile, 'utf8'));
-    this.transaction(() => seed.forEach((q) => this.addQuestion(q)));
+    this.transaction(() => seed.forEach((text) => this.addQuestion(text)));
     return seed.length;
   }
 
-  addQuestion({ text, type = 'text', options = [] }) {
-    const clean = validateQuestion({ text, type, options });
-    const info = this.db
-      .prepare('INSERT INTO questions (text, type, options) VALUES (?, ?, ?)')
-      .run(clean.text, clean.type, JSON.stringify(clean.options));
+  addQuestion(text) {
+    const info = this.db.prepare('INSERT INTO questions (text) VALUES (?)').run(validateQuestion(text));
     return Number(info.lastInsertRowid);
   }
 
-  updateQuestion(id, { text, type, options }) {
-    const clean = validateQuestion({ text, type, options });
-    this.db
-      .prepare('UPDATE questions SET text = ?, type = ?, options = ? WHERE id = ?')
-      .run(clean.text, clean.type, JSON.stringify(clean.options), id);
+  updateQuestion(id, text) {
+    this.db.prepare('UPDATE questions SET text = ? WHERE id = ?').run(validateQuestion(text), id);
   }
 
   setQuestionActive(id, active) {
@@ -199,15 +191,24 @@ class SurveyStore {
 
   // ---- reporting --------------------------------------------------------
 
-  listResponses({ questionId } = {}) {
-    const where = questionId ? 'WHERE r.question_id = ?' : '';
-    const params = questionId ? [questionId] : [];
+  /** Responses, newest first, optionally filtered by question and/or a text search in the answer. */
+  listResponses({ questionId, search } = {}) {
+    const where = [];
+    const params = [];
+    if (questionId) {
+      where.push('r.question_id = ?');
+      params.push(questionId);
+    }
+    if (search) {
+      where.push("r.answer LIKE ? ESCAPE '\\'");
+      params.push(`%${search.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+    }
     return this.db
       .prepare(
-        `SELECT r.id, r.question_id, q.text AS question, q.type, r.answer, r.submitted_at
+        `SELECT r.id, r.question_id, q.text AS question, r.answer, r.submitted_at
            FROM responses r
            JOIN questions q ON q.id = r.question_id
-           ${where}
+           ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
           ORDER BY r.id DESC`
       )
       .all(...params);
@@ -231,19 +232,13 @@ class SurveyStore {
   }
 }
 
-function validateQuestion({ text, type, options }) {
-  text = String(text || '').trim();
+function validateQuestion(text) {
+  text = String(text ?? '').trim().replace(/\s+/g, ' ');
   if (!text) throw new ValidationError('Question text is required.');
-  if (!QUESTION_TYPES.includes(type)) throw new ValidationError('Unknown question type.');
-  if (typeof options === 'string') options = options.split(/\r?\n/);
-  options = (options || []).map((o) => String(o).trim()).filter(Boolean);
-  if (type === 'choice' && options.length < 2) {
-    throw new ValidationError('A multiple choice question needs at least two options.');
-  }
-  if (type !== 'choice') options = [];
-  return { text, type, options };
+  if (text.length > MAX_QUESTION_LENGTH) throw new ValidationError(`Question is too long (max ${MAX_QUESTION_LENGTH} characters).`);
+  return text;
 }
 
 class ValidationError extends Error {}
 
-module.exports = { SurveyStore, ValidationError, QUESTION_TYPES, hashToken };
+module.exports = { SurveyStore, ValidationError, hashToken };
