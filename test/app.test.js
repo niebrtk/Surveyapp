@@ -77,7 +77,7 @@ test('a participant keeps the same question and can answer only once', async () 
   assert.strictEqual(res.status, 303);
 
   const after = await page('/').then((r) => r.text());
-  assert.match(after, /already completed/);
+  assert.match(after, /completed this survey/);
 
   // A second submission is ignored.
   await page('/', { form: { answer: answerFor(q1) } });
@@ -118,7 +118,7 @@ test('deleting a question does not let finished participants answer again', asyn
   const q = await assignedQuestion(page);
   await page('/', { form: { answer: answerFor(q) } });
   store.deleteQuestion(q.id);
-  assert.match(await page('/').then((r) => r.text()), /already completed/);
+  assert.match(await page('/').then((r) => r.text()), /completed this survey/);
 });
 
 test('admin pages require login', async () => {

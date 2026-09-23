@@ -87,7 +87,7 @@ function createApp({ store, adminPassword, secureCookies = false }) {
 
     const existing = store.getAssignment(token);
     if (existing?.completed) {
-      return res.send(views.messagePage(title, 'Thank you!', 'You have already completed this survey. Your answer has been saved anonymously.'));
+      return res.send(views.messagePage(title, 'Thank you', 'Your answer has been saved anonymously. You have completed this survey.', 'check'));
     }
     if (!existing && !store.isOpen()) {
       return res.send(views.messagePage(title, 'Survey closed', 'This survey is not accepting new answers at the moment.'));
