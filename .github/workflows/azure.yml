@@ -1,0 +1,55 @@
+name: Test and deploy to Azure
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # Deploys only from the default branch, and only once the Azure app is set up
+  # (repository variable AZURE_WEBAPP_NAME + secret AZURE_WEBAPP_PUBLISH_PROFILE).
+  # See DEPLOY_AZURE.md.
+  deploy:
+    needs: test
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      vars.AZURE_WEBAPP_NAME != ''
+    runs-on: ubuntu-latest
+    concurrency: azure-deploy
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.webapp-url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+      - name: Assemble the app package
+        run: |
+          mkdir release
+          cp -r package.json package-lock.json src public node_modules release/
+      - name: Deploy to Azure App Service
+        id: deploy
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: release

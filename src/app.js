@@ -100,6 +100,8 @@ function createApp({ store, adminPassword, secureCookies = false }) {
     res.status(error ? 400 : 200).send(views.questionPage(title, question, { error, draft, maxLength: MAX_ANSWER_LENGTH }));
   }
 
+  app.get('/healthz', (req, res) => res.type('text').send('ok'));
+
   app.get('/', (req, res) => renderParticipant(req, res));
 
   app.post('/', (req, res) => {

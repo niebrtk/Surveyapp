@@ -5,11 +5,18 @@ const { DatabaseSync } = require('node:sqlite');
 
 const MAX_QUESTION_LENGTH = 1000;
 
-function openDatabase(file) {
+const JOURNAL_MODES = ['WAL', 'DELETE', 'TRUNCATE', 'PERSIST'];
+
+// WAL is fastest, but it needs shared memory and does not work reliably on
+// network drives (e.g. the /home share on Azure App Service). Use DELETE there.
+function openDatabase(file, { journalMode = 'WAL' } = {}) {
+  journalMode = String(journalMode).toUpperCase();
+  if (!JOURNAL_MODES.includes(journalMode)) throw new Error(`Unsupported SQLite journal mode: ${journalMode}`);
   if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec(`
-    PRAGMA journal_mode = WAL;
+    PRAGMA journal_mode = ${journalMode};
+    PRAGMA busy_timeout = 5000;
     PRAGMA foreign_keys = ON;
 
     CREATE TABLE IF NOT EXISTS questions (
@@ -55,8 +62,8 @@ function parseQuestion(row) {
 }
 
 class SurveyStore {
-  constructor(file) {
-    this.db = openDatabase(file);
+  constructor(file, options) {
+    this.db = openDatabase(file, options);
   }
 
   close() {

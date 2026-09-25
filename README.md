@@ -23,12 +23,16 @@ where you paste one question per line.
 
 ### Configuration (environment variables)
 
-| Variable         | Default          | Description                                                   |
-| ---------------- | ---------------- | ------------------------------------------------------------- |
-| `ADMIN_PASSWORD` | – (required)     | Password for the admin panel                                  |
-| `PORT`           | `3000`           | HTTP port                                                     |
-| `DATABASE_FILE`  | `data/survey.db` | SQLite file holding questions and answers                     |
-| `SECURE_COOKIES` | off              | Set to `1` when served over HTTPS (recommended in production) |
+| Variable              | Default                                  | Description                                                        |
+| --------------------- | ---------------------------------------- | ------------------------------------------------------------------ |
+| `ADMIN_PASSWORD`      | – (required)                             | Password for the admin panel                                       |
+| `PORT`                | `3000`                                   | HTTP port                                                          |
+| `DATABASE_FILE`       | `data/survey.db` (Azure: `/home/data/survey.db`) | SQLite file holding questions and answers                  |
+| `SQLITE_JOURNAL_MODE` | `WAL` (Azure: `DELETE`)                  | Use `DELETE` when the database file is on a network drive          |
+| `SECURE_COOKIES`      | off (Azure: on)                          | Set to `1` when served over HTTPS (recommended in production)      |
+
+On Azure App Service, the app detects the platform and uses the Azure defaults shown above,
+so `ADMIN_PASSWORD` is the only setting you need there.
 
 ## How it works
 
@@ -83,6 +87,11 @@ npm test
 
 ## Deploying
 
-The app runs on any host with Node 22.5 or newer (a VPS, Render, Railway, Fly.io…). Make sure
+**Azure App Service (free F1 plan, e.g. with Azure for Students):** follow
+[DEPLOY_AZURE.md](DEPLOY_AZURE.md) (in Polish). The included GitHub Actions workflow
+(`.github/workflows/azure.yml`) runs the tests on every push. Once the Azure app is
+connected, it also deploys every push to the default branch.
+
+**Anywhere else:** the app runs on any host with Node 22.5 or newer. Make sure
 `DATABASE_FILE` points to persistent storage, set `ADMIN_PASSWORD`, serve the app over
 HTTPS and set `SECURE_COOKIES=1`. Back up the SQLite file to keep your data safe.

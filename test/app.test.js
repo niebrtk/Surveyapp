@@ -210,3 +210,20 @@ test('cross-site admin POSTs are rejected', async () => {
   const res = await admin('/admin/reset', { form: {}, headers: { origin: 'https://evil.example' } });
   assert.strictEqual(res.status, 403);
 });
+
+test('health check endpoint responds', async () => {
+  const res = await browser()('/healthz');
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(await res.text(), 'ok');
+});
+
+test('database can use the DELETE journal mode (for network drives)', () => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'survey-'));
+  const s = new SurveyStore(path.join(dir, 'survey.db'), { journalMode: 'DELETE' });
+  assert.strictEqual(s.db.prepare('PRAGMA journal_mode').get().journal_mode, 'delete');
+  s.close();
+  fs.rmSync(dir, { recursive: true });
+  assert.throws(() => new SurveyStore(':memory:', { journalMode: 'OFF; DROP TABLE x' }), /Unsupported/);
+});
